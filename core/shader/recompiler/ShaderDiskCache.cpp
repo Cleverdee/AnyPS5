@@ -1380,6 +1380,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
 }
 
 constexpr std::string_view NeutralSwitches[] = {
+    "APS5_UNKEYED_TABLE_KEYS",
     "APS5_PROFILE_DRAW",
     "APS5_DUMP_IR",
     "APS5_NO_CODE_HASH_KEY",

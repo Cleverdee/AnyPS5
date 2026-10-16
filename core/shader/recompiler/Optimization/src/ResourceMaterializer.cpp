@@ -357,6 +357,14 @@ std::string hexText(std::uint64_t value) {
     return text;
 }
 
+std::uint32_t UnkeyedTableKeys() {
+    static const std::uint32_t keys = [] {
+        const char* text = std::getenv("APS5_UNKEYED_TABLE_KEYS");
+        return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 0)) : 0u;
+    }();
+    return keys;
+}
+
 std::uint32_t TableKeyScanLimit() {
     static const std::uint32_t limit = [] {
         const char* text = std::getenv("APS5_IMAGE_TABLE_KEY_SCAN");
@@ -1054,6 +1062,7 @@ private:
         }
         records.records = std::min(records.records, ImageTableAbi::KeyRecords(column.maxKey, column.stride));
         records.keys = std::min(records.records, ImageTableAbi::MaxKeys);
+        if (column.keyDomains.empty() && UnkeyedTableKeys() != 0u) records.keys = std::min(records.keys, UnkeyedTableKeys());
         records.outside = records.keys < records.records;
         if (!column.keyDomains.empty() && records.keys != 0u) {
             Narrow(column, records);

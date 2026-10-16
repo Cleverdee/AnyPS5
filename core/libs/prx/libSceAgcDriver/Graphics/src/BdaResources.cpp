@@ -260,6 +260,13 @@ void BdaResources::CheckFault() const {
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::ImageTable) {
         const auto table = std::find_if(imageTables.begin(), imageTables.end(), [&](const ImageTableFaults& candidate) { return candidate.stage == report.stage; });
         const auto* tables = table != imageTables.end() ? &*table : imageTables.size() == 1 ? &imageTables.front() : nullptr;
+        static const bool unkeyedCap = std::getenv("APS5_UNKEYED_TABLE_KEYS") != nullptr;
+        if (unkeyedCap && tables != nullptr && report.bytes < tables->poison.size() && tables->poison[report.bytes].reason == static_cast<std::uint32_t>(ShaderRecompiler::ImageTableAbi::PoisonReason::OutsideSnapshot)) {
+            static std::atomic<std::uint32_t> reported{0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 64u) std::fprintf(stderr, "[image-table] APS5_UNKEYED_TABLE_KEYS: shader 0x%llx stage %u pc 0x%x selected the descriptor at 0x%llx outside the capped snapshot; ignored\n", static_cast<unsigned long long>(tables->shader), report.stage, report.instruction, static_cast<unsigned long long>(report.address));
+            std::memset(fault->Bytes().data(), 0, fault->Bytes().size());
+            return;
+        }
         std::ostringstream message;
         message << "image table: shader 0x" << std::hex << (tables != nullptr ? tables->shader : 0u) << std::dec << " stage " << report.stage << " pc 0x" << std::hex << report.instruction << " selected the descriptor at 0x" << report.address << std::dec;
         if (tables != nullptr && report.bytes < tables->poison.size()) {
