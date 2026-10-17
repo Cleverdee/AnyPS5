@@ -1399,10 +1399,23 @@ public:
                 continue;
             }
             surface = {};
-            GuestLayer current{resource.baseAddress + geometry.GuestLayerOffset(layer), geometry.layerBytes, resource.tileMode, geometry.thick, GuestMemory::CollectWrites(resource.baseAddress + geometry.GuestLayerOffset(layer), static_cast<std::size_t>(geometry.layerBytes))};
-            current.uncommitted = current.generation == 0 && GuestMemory::CommittedRanges(current.address, static_cast<std::size_t>(current.bytes)).empty();
-            const bool unchanged = current.uncommitted ? held.uncommitted : held.generation != 0 && GuestMemory::UnchangedSince(current.address, static_cast<std::size_t>(current.bytes), held.generation);
-            if (held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick && !Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes)) && unchanged) {
+            const auto layerAddress = resource.baseAddress + geometry.GuestLayerOffset(layer);
+            const auto layerBytes = static_cast<std::size_t>(geometry.layerBytes);
+            // A partially resident layer (the walk fails on its uncommitted pages) is tracked over its
+            // committed ranges, as cachedTexture tracks partially resident textures: it is kept while
+            // the same ranges are committed and unwritten.
+            static const bool partialLayers = std::getenv("APS5_NO_PARTIAL_DEPTH_LAYERS") == nullptr;
+            GuestLayer current{layerAddress, geometry.layerBytes, resource.tileMode, geometry.thick, GuestMemory::CollectWrites(layerAddress, layerBytes)};
+            if (current.generation == 0 && partialLayers) {
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+                if (const auto partial = GuestMemory::CollectCommittedWrites(layerAddress, layerBytes, ranges); partial != 0 && !ranges.empty()) {
+                    current.generation = partial;
+                    current.committed = std::move(ranges);
+                }
+            }
+            current.uncommitted = current.generation == 0 && GuestMemory::CommittedRanges(current.address, layerBytes).empty();
+            const bool unchanged = current.uncommitted ? held.uncommitted : held.generation != 0 && (current.committed.has_value() ? GuestMemory::UnchangedCommittedSince(*current.committed, held.generation) : GuestMemory::UnchangedSince(current.address, layerBytes, held.generation));
+            if (held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick && held.committed == current.committed && !Recorder::SnapshotWriteOverlaps(current.address, layerBytes) && unchanged) {
                 held.generation = current.generation;
                 continue;
             }
@@ -1443,6 +1456,7 @@ private:
         bool thick = false;
         std::uint64_t generation = 0;
         bool uncommitted = false;
+        std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
     };
 
     VkImage image = VK_NULL_HANDLE;
