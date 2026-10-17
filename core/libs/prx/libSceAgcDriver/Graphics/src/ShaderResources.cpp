@@ -451,6 +451,7 @@ struct LookupRecord {
     std::uint64_t generation;
     const StorageTexture* source;
     bool depth = false;
+    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed{};
 };
 
 thread_local std::vector<LookupRecord>* lookupLogSlot = nullptr;
@@ -979,7 +980,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 it->committed = std::move(committed);
                 it->untracked = untracked;
                 touchTexture(cache, it);
-                logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
+                logLookup({it->texture.get(), resource, guestBytes, *keys, snapshotGeneration, nullptr, false, it->committed});
                 reportTextureCounters();
                 if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
                 return it->texture;
@@ -1041,7 +1042,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     auto texture = entry.texture;
     if (!admitTexture(cache, key, entry.accounted, budget)) {
         noteReleased(texture);
-        logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
+        logLookup({texture.get(), resource, guestBytes, *keys, snapshotGeneration, source.get(), false, entry.committed});
         reportCacheCounts(cache, budget);
         reportTextureCounters();
         if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
@@ -1050,7 +1051,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     cache.bytes += entry.accounted;
     entry.present = Recorder::Presents();
     ++cache.counts.inserted;
-    logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
+    logLookup({texture.get(), resource, guestBytes, *keys, snapshotGeneration, source.get(), false, entry.committed});
     cache.entries.push_front(std::move(entry));
     cache.index[key] = cache.entries.begin();
     if (source != nullptr) cache.views.emplace(source.get(), cache.entries.begin());
@@ -2889,7 +2890,7 @@ namespace {
 // of the reused ones, fast = every image proved current from stamps, full = the lookups were repeated.
 // Why the fast path left an object to the full walk (the "fast-fail by reason" counts).
 using FastFail = ShaderResources::FastFail;
-constexpr std::array<const char*, static_cast<std::size_t>(FastFail::Count)> FastFailNames{"no record", "collect", "pending image", "evicted image", "memory changed", "keys", "cleared view", "storage keys", "depth surface", "replaced texture", "audit"};
+constexpr std::array<const char*, static_cast<std::size_t>(FastFail::Count)> FastFailNames{"no record", "collect", "pending image", "evicted image", "memory changed", "keys", "cleared view", "storage keys", "depth surface", "replaced texture", "audit", "collect (view)", "collect (storage image)", "committed ranges"};
 using OwnRefreshFallback = ShaderResources::OwnRefreshFallback;
 constexpr std::array<const char*, static_cast<std::size_t>(OwnRefreshFallback::Count)> OwnRefreshFallbackNames{"disabled", "snapshot texture", "cleared view", "foreign view", "surface key", "not imported", "uncached", "re-run failed"};
 
@@ -3125,7 +3126,7 @@ void ShaderResources::captureValidation() {
     for (std::size_t i = 0; i < textures.size(); ++i) {
         if (indices[i] == log.size()) continue;
         const auto& found = log[indices[i]];
-        validatedTextures[i] = {found.resource, found.bytes, found.keys, found.generation, 0, found.source, found.depth, true};
+        validatedTextures[i] = {found.resource, found.bytes, found.keys, found.generation, 0, found.source, found.depth, true, found.committed};
     }
     lookupLog().clear();
     const auto trim = [](auto& scratch) {
@@ -3202,6 +3203,8 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     auto& images = ShaderRecompiler::ThreadOwned(imagesSlot);
     thread_local std::vector<DccKeys>* scannedKeysSlot = nullptr;
     auto& scannedKeys = ShaderRecompiler::ThreadOwned(scannedKeysSlot);
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* committedSlot = nullptr;
+    auto& committedRanges = ShaderRecompiler::ThreadOwned(committedSlot);
     queries.clear();
     pending.clear();
     owners.clear();
@@ -3228,6 +3231,16 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             return fail(FastFail::Collect);
         }
         const auto* source = surface.source;
+        surface.collected = GuestMemory::CollectWrites(address, bytes);
+        if (surface.committed.has_value()) {
+            // Partially resident snapshot: cachedTexture's unchanged rule over the committed pages
+            // (the same ranges still committed, none written since, no recorded write pending).
+            if (surface.collected != 0 || source != nullptr) return fail(FastFail::Committed);
+            surface.collected = GuestMemory::CollectCommittedWrites(address, bytes, committedRanges);
+            if (surface.collected == 0 || committedRanges != *surface.committed || Recorder::SnapshotWriteOverlaps(address, bytes) || !GuestMemory::UnchangedCommittedSince(committedRanges, surface.generation)) return fail(FastFail::Committed);
+        } else if (surface.collected == 0) {
+            return fail(source != nullptr ? FastFail::CollectView : FastFail::Collect);
+        }
         if (!keyProofs) {
             // Without proofs the keys are compared with the record's (a cleared view's identity
             // below is the record's too): the scan repeats on every call, as before.
@@ -3266,7 +3279,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             if (!source->Cached()) return fail(FastFail::Evicted);
             queries.push_back({address, bytes, source->GenerationFor(address, bytes)});
             images.push_back(source);
-        } else {
+        } else if (!surface.committed.has_value()) {
             queries.push_back({address, bytes, surface.generation});
         }
     }
@@ -3353,7 +3366,7 @@ bool ShaderResources::fastRevalidateEach() {
     if (validatedTextures.size() != textures.size()) return false;
     for (std::size_t i = 0; i < textures.size(); ++i) {
         auto& surface = validatedTextures[i];
-        if (!surface.valid) return false;
+        if (!surface.valid || surface.committed.has_value()) return false;
         if (surface.depth) {
             if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return false;
             continue;

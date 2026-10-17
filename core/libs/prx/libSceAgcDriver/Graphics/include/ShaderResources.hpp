@@ -321,7 +321,7 @@ public:
     std::size_t BindingCount() const { return bindings.size(); }
     // Why the fast proof of a Revalidate left the object to the full walk (the [rescache]
     // revalidate line's reasons); Count: it did not.
-    enum class FastFail : std::size_t { NoRecord, Collect, Pending, Evicted, Changed, Keys, ClearedView, StorageKeys, Depth, Replaced, Audit, Count };
+    enum class FastFail : std::size_t { NoRecord, Collect, Pending, Evicted, Changed, Keys, ClearedView, StorageKeys, Depth, Replaced, Audit, CollectView, CollectStorage, Committed, Count };
     struct CollectRefusals {
         std::uint64_t sampled = 0;
         std::uint64_t storage = 0;
@@ -534,6 +534,9 @@ private:
         const StorageTexture* source = nullptr;
         bool depth = false;
         bool valid = false;
+        // Snapshot textures over partially resident memory: the committed ranges the content was
+        // proved against (cachedTexture's rule); `generation` is then the committed collect's.
+        std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
     };
     void captureValidation();
     // A surface of this object the fast proof found a foreign image pending over: the element
