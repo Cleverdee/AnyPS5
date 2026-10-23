@@ -150,6 +150,149 @@ bool HandleWatch(EXCEPTION_POINTERS* info) {
     return true;
 }
 
+// APS5_JOB_IDLE_SLEEP=1: Demon's Souls' job workers call their job poll in a loop that never yields, so about a
+// dozen guest threads hold a host core each while there is no work. The one call site of the poll is redirected
+// to a thunk that runs the poll and, when it found no job, sleeps APS5_JOB_IDLE_SLEEP_US (default 50) before
+// returning. The thunk keeps every register, the flags and the x87/SSE/AVX state: the caller may rely on more
+// than the SysV ABI promises. Matched by code shape (US 01.004 and EU 01.007 builds differ in offsets and
+// displacements); nothing is patched unless exactly one call site and its poll match. Idea and thunk from
+// KytyPS5 #599 (chenxiao07, GPL-2.0).
+DWORD g_jobIdleTimerSlot = TLS_OUT_OF_INDEXES;
+LONGLONG g_jobIdleSleep100ns = 500;
+
+void JobIdleWait() {
+    auto timer = static_cast<HANDLE>(TlsGetValue(g_jobIdleTimerSlot));
+    if (timer == nullptr) {
+        constexpr DWORD highResolution = 0x2;
+        timer = CreateWaitableTimerExW(nullptr, nullptr, highResolution, TIMER_ALL_ACCESS);
+        if (timer == nullptr) timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+        TlsSetValue(g_jobIdleTimerSlot, timer);
+    }
+    LARGE_INTEGER due{};
+    due.QuadPart = -g_jobIdleSleep100ns;
+    if (timer != nullptr && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, INFINITE);
+    else SwitchToThread();
+}
+
+bool MatchesShape(const std::uint8_t* code, const std::int16_t* shape, std::size_t length) {
+    for (std::size_t i = 0; i < length; ++i) {
+        if (shape[i] >= 0 && code[i] != static_cast<std::uint8_t>(shape[i])) return false;
+    }
+    return true;
+}
+
+void InstallJobIdleSleep() {
+    const char* enabled = std::getenv("APS5_JOB_IDLE_SLEEP");
+    if (enabled == nullptr || enabled[0] == '0') return;
+    if (const char* micros = std::getenv("APS5_JOB_IDLE_SLEEP_US")) {
+        const auto value = std::strtoll(micros, nullptr, 10);
+        if (value > 0 && value <= 100000) g_jobIdleSleep100ns = value * 10;
+    }
+    // call poll; test al, al; je <loop>; mov r15, [rbp-0x38]; mov rsi, [r15+disp32]; test rsi, rsi; je
+    static constexpr std::int16_t callShape[] = {0xe8, -1, -1, -1, -1, 0x84, 0xc0, 0x74, -1, 0x4c, 0x8b, 0x7d, 0xc8, 0x49, 0x8b, 0xb7, -1, 0x00, 0x00, 0x00, 0x48, 0x85, 0xf6, 0x74};
+    // push rbp; mov rbp, rsp; push r15..rbx; sub rsp, imm32; mov r14, [rip+disp32]
+    static constexpr std::int16_t pollShape[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec, -1, 0x00, 0x00, 0x00, 0x4c, 0x8b, 0x35};
+    auto* image = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(image + dos->e_lfanew);
+    const auto* section = IMAGE_FIRST_SECTION(nt);
+    std::uint8_t* site = nullptr;
+    std::uint8_t* poll = nullptr;
+    int matches = 0;
+    for (unsigned s = 0; s < nt->FileHeader.NumberOfSections; ++s, ++section) {
+        if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+        auto* begin = image + section->VirtualAddress;
+        const auto size = static_cast<std::size_t>(std::max(section->Misc.VirtualSize, section->SizeOfRawData));
+        if (size < std::size(callShape)) continue;
+        for (std::size_t at = 0; at + std::size(callShape) <= size; ++at) {
+            if (begin[at] != 0xe8 || !MatchesShape(begin + at, callShape, std::size(callShape))) continue;
+            if (static_cast<std::int8_t>(begin[at + 8]) >= 0) continue;
+            std::int32_t rel = 0;
+            std::memcpy(&rel, begin + at + 1, sizeof(rel));
+            auto* target = begin + at + 5 + rel;
+            if (target < begin || target + std::size(pollShape) > begin + size || !MatchesShape(target, pollShape, std::size(pollShape))) continue;
+            ++matches;
+            site = begin + at;
+            poll = target;
+        }
+    }
+    if (matches != 1) {
+        Report("[job-idle] APS5_JOB_IDLE_SLEEP: %d matching job poll call sites, nothing patched\n", matches);
+        return;
+    }
+    // The thunk must sit within rel32 reach of the call site: take the first free 64 KiB block after the image.
+    auto* thunk = static_cast<std::uint8_t*>(nullptr);
+    for (auto candidate = (reinterpret_cast<std::uintptr_t>(image) + nt->OptionalHeader.SizeOfImage + 0xffff) & ~std::uintptr_t{0xffff};
+         candidate < reinterpret_cast<std::uintptr_t>(site) + 0x40000000ull && thunk == nullptr; candidate += 0x10000) {
+        thunk = static_cast<std::uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    }
+    if (thunk == nullptr) {
+        Report("[job-idle] APS5_JOB_IDLE_SLEEP: no free page near the image, nothing patched\n");
+        return;
+    }
+    g_jobIdleTimerSlot = TlsAlloc();
+    std::uint8_t code[320];
+    std::size_t n = 0;
+    const auto emit = [&](std::initializer_list<std::uint8_t> bytes) { for (auto b : bytes) code[n++] = b; };
+    const auto emit32 = [&](std::int32_t value) { std::memcpy(code + n, &value, 4); n += 4; };
+    emit({0x48, 0x83, 0xec, 0x08});                                   // sub rsp, 8
+    emit({0xe8}); emit32(static_cast<std::int32_t>(poll - (thunk + n + 4))); // call poll
+    emit({0x48, 0x83, 0xc4, 0x08});                                   // add rsp, 8
+    emit({0x84, 0xc0});                                               // test al, al
+    emit({0x0f, 0x85}); const auto done = n; emit32(0);               // jnz done
+    emit({0x9c, 0x50, 0x51, 0x52, 0x56, 0x57, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, 0x55}); // pushfq; push rax rcx rdx rsi rdi r8-r11 rbp
+    emit({0x48, 0x89, 0xe5});                                         // mov rbp, rsp
+    emit({0x48, 0x83, 0xe4, 0xc0});                                   // and rsp, -64
+    emit({0x48, 0x81, 0xec, 0x00, 0x04, 0x00, 0x00});                 // sub rsp, 0x400
+    // XSAVE leaves the reserved bytes of the area's header as they were, and XRSTOR faults on any set: zero it.
+    for (std::int32_t offset = 0x200; offset < 0x240; offset += 8) {
+        emit({0x48, 0xc7, 0x84, 0x24}); emit32(offset); emit32(0);    // mov qword [rsp+offset], 0
+    }
+    emit({0xb8, 0x07, 0x00, 0x00, 0x00, 0x31, 0xd2});                 // mov eax, 7; xor edx, edx
+    emit({0x48, 0x0f, 0xae, 0x24, 0x24});                             // xsave64 [rsp]
+    emit({0x48, 0x83, 0xec, 0x20});                                   // sub rsp, 32 (shadow space)
+    emit({0x48, 0xb8});                                               // mov rax, imm64
+    const auto wait = reinterpret_cast<std::uint64_t>(&JobIdleWait);
+    std::memcpy(code + n, &wait, 8); n += 8;
+    emit({0xff, 0xd0});                                               // call rax
+    emit({0x48, 0x83, 0xc4, 0x20});                                   // add rsp, 32
+    emit({0xb8, 0x07, 0x00, 0x00, 0x00, 0x31, 0xd2});                 // mov eax, 7; xor edx, edx
+    emit({0x48, 0x0f, 0xae, 0x2c, 0x24});                             // xrstor64 [rsp]
+    emit({0x48, 0x89, 0xec});                                         // mov rsp, rbp
+    emit({0x5d, 0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58, 0x5f, 0x5e, 0x5a, 0x59, 0x58, 0x9d}); // pop rbp r11-r8 rdi rsi rdx rcx rax; popfq
+    const auto ret = n;
+    emit({0xc3});                                                     // done: ret
+    const auto jump = static_cast<std::int32_t>(ret - (done + 4));
+    std::memcpy(code + done, &jump, 4);
+    std::memcpy(thunk, code, n);
+    DWORD old = 0;
+    VirtualProtect(thunk, 0x1000, PAGE_EXECUTE_READ, &old);
+    FlushInstructionCache(GetCurrentProcess(), thunk, n);
+    // Rewrite the call's rel32 with one aligned 8-byte store (no guest thread runs yet, but stay atomic).
+    auto* word = reinterpret_cast<std::uint8_t*>(reinterpret_cast<std::uintptr_t>(site + 1) & ~std::uintptr_t{7});
+    if (site + 5 > word + 8) {
+        Report("[job-idle] APS5_JOB_IDLE_SLEEP: call site straddles an 8-byte boundary, nothing patched\n");
+        return;
+    }
+    if (!VirtualProtect(word, 8, PAGE_EXECUTE_READWRITE, &old)) {
+        Report("[job-idle] APS5_JOB_IDLE_SLEEP: cannot make the call site writable (%lu), nothing patched\n", GetLastError());
+        return;
+    }
+    std::uint64_t value = 0;
+    std::memcpy(&value, word, 8);
+    std::uint8_t bytes[8];
+    std::memcpy(bytes, &value, 8);
+    const auto newRel = static_cast<std::int32_t>(thunk - (site + 5));
+    std::memcpy(bytes + (site + 1 - word), &newRel, 4);
+    std::memcpy(&value, bytes, 8);
+    reinterpret_cast<std::atomic<std::uint64_t>*>(word)->store(value, std::memory_order_release);
+    DWORD restored = 0;
+    VirtualProtect(word, 8, old, &restored);
+    FlushInstructionCache(GetCurrentProcess(), site, 5);
+    Report("[job-idle] APS5_JOB_IDLE_SLEEP: job poll call at image+0x%llx -> poll image+0x%llx redirected through a %zu-byte thunk at 0x%llx, idle sleep %lld us\n",
+        static_cast<unsigned long long>(site - image), static_cast<unsigned long long>(poll - image), n, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(thunk)), g_jobIdleSleep100ns / 10);
+}
+
 void InstallWatch() {
     // APS5_WATCH_ADDR=<absolute hex address> watches guest data that is mapped later: the page is
     // protected once it has been committed.
@@ -678,6 +821,7 @@ const bool g_crashReportInstalled = [] {
     std::signal(SIGABRT, AbortSignalHandler);
     _set_invalid_parameter_handler(InvalidParameterHandler);
     InstallWatch();
+    InstallJobIdleSleep();
     if (const char* hang = std::getenv("APS5_HANG_DUMP_SECS")) {
         unsigned long long seconds = 0;
         if (hang[0] >= '0' && hang[0] <= '9') {
