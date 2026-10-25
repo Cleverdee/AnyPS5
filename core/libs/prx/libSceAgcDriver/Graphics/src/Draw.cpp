@@ -2394,6 +2394,11 @@ bool WriteOnlyPasses() {
     return enabled;
 }
 
+bool IndirectPassContinue() {
+    static const bool enabled = std::getenv("APS5_INDIRECT_PASS_CONTINUE") != nullptr;
+    return enabled;
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr) {
     std::uint32_t subdraw = 0;
     auto* recorder = record.recorder;
@@ -2478,8 +2483,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     const PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
+    using IndirectRule = Pm4::DrawParameters::IndirectDraw::Rule;
+    const bool inPlaceIndirect = gpuIndirect && IndirectPassContinue() && args->vertexRule == IndirectRule::InPlace && args->instanceRule == IndirectRule::InPlace;
     if (UsesMeshWindow(shaders)) PrepareMeshWindow(context);
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || captured || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
+    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || (gpuIndirect && !inPlaceIndirect) || meshIndirect || captured || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
     outcome.passContinued = continued;
@@ -2514,6 +2521,15 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
     if (continued) {
+        // An in-place indirect draw inside a running pass: the pass's opening barrier made every
+        // earlier write visible to indirect reads, and the pass hazards end the pass on a write to
+        // the records within it.
+        if (gpuIndirect) {
+            recorder->NotePendingRead(args->arguments, static_cast<std::size_t>(args->RangeBytes()), Recorder::ReadKind::Indirect);
+            if (args->countIndirect) recorder->NotePendingRead(args->countAddress, 4, Recorder::ReadKind::Indirect);
+            argumentBuffer = record.indirect->argumentImport->buffer;
+            argumentOffset = HostImportOffset(*record.indirect->argumentImport, args->arguments);
+        }
         record.pipeline->Continue(commands, state);
     } else {
         for (const auto& proxy : record.proxies) {
@@ -2521,7 +2537,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             countBarrier(2);
         }
         if (start.barrier) {
-            const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+            const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | (IndirectPassContinue() ? VK_ACCESS_INDIRECT_COMMAND_READ_BIT : 0u)};
             context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
             countBarrier(1);
         }

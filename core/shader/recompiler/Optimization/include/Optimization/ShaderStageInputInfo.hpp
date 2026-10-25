@@ -154,6 +154,7 @@ struct ShaderVertexInputInfo {
     bool fetchExternal = false;
     bool fetchEmbedded = false;
     std::int32_t startInstanceSgpr = -1;
+    bool vertexIndexBase = false;
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {

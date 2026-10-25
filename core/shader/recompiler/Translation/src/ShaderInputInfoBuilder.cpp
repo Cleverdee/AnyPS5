@@ -204,6 +204,7 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         vertexStorage.paClVsOutCntl = vertex.paClVsOutCntl;
         vertexStorage.depthRemap = {vertex.depthRemapMode};
         vertexStorage.startInstanceSgpr = vertex.startInstanceSgpr;
+        vertexStorage.vertexIndexBase = vertex.vertexIndexBase;
         vertexStorage.pointList = vertex.pointList;
         vertexStorage.pointSize = vertex.pointSize;
         vertexStorage.pointSizeMin = vertex.pointSizeMin;

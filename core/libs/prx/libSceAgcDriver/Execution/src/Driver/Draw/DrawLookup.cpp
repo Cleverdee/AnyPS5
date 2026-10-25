@@ -53,6 +53,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 mix(vertex.fetchEmbedded);
                 mix(vertex.paClVsOutCntl);
                 mix(static_cast<std::uint32_t>(vertex.startInstanceSgpr));
+                mix(vertex.vertexIndexBase);
                 mix(vertex.pointList);
                 mix(std::bit_cast<std::uint32_t>(vertex.pointSize));
                 mix(std::bit_cast<std::uint32_t>(vertex.pointSizeMin));

@@ -310,14 +310,23 @@ bool IndirectBaseInstance() {
 
 struct BaseInstanceProgramsStorage {};
 
-std::unordered_map<std::uint64_t, bool>& BaseInstancePrograms() {
-    return HostThreadLocal<std::unordered_map<std::uint64_t, bool>, BaseInstanceProgramsStorage>();
+bool IndirectBaseVertex() {
+    static const bool enabled = std::getenv("APS5_INDIRECT_BASE_VERTEX") != nullptr;
+    return enabled;
+}
+
+constexpr std::uint8_t BaseInstanceEligible = 1u, BaseVertexEligible = 2u;
+
+std::unordered_map<std::uint64_t, std::uint8_t>& BaseInstancePrograms() {
+    return HostThreadLocal<std::unordered_map<std::uint64_t, std::uint8_t>, BaseInstanceProgramsStorage>();
 }
 
 void RequestBaseInstance(std::uint64_t codeAddress, const Pm4::DrawParameters& parameters, std::optional<ShaderRecompiler::ShaderVertexStageInfo>& info) {
     if (!info || !parameters.indirect || !IndirectBaseInstance() || parameters.indirect->startInstanceSgpr < 0) return;
     const auto known = BaseInstancePrograms().find(codeAddress);
-    if (known != BaseInstancePrograms().end() && known->second) info->startInstanceSgpr = parameters.indirect->startInstanceSgpr;
+    if (known == BaseInstancePrograms().end() || (known->second & BaseInstanceEligible) == 0) return;
+    info->startInstanceSgpr = parameters.indirect->startInstanceSgpr;
+    if ((known->second & BaseVertexEligible) != 0 && parameters.indexed) info->vertexIndexBase = true;
 }
 
 void NoteBaseInstance(std::uint64_t codeAddress, const ShaderRecompiler::RecompileResult& result, const Pm4::DrawParameters& parameters) {
@@ -325,8 +334,11 @@ void NoteBaseInstance(std::uint64_t codeAddress, const ShaderRecompiler::Recompi
     const auto sgpr = parameters.indirect->startInstanceSgpr;
     if (sgpr < 0 || BaseInstancePrograms().contains(codeAddress)) return;
     const bool instanceAttributes = std::ranges::any_of(result.vertexAttributes, [](const auto& attribute) { return attribute.fetchIndex != 0; });
+    const bool vertexAttributes = std::ranges::any_of(result.vertexAttributes, [](const auto& attribute) { return attribute.fetchIndex == 0; });
     const bool unfolded = result.instanceOffsetSgpr != sgpr || result.instanceOffsetShared;
-    BaseInstancePrograms()[codeAddress] = unfolded && !result.instanceOffsetConflict && (!instanceAttributes || result.instanceOffsetSgpr == sgpr);
+    const bool instance = unfolded && !result.instanceOffsetConflict && (!instanceAttributes || result.instanceOffsetSgpr == sgpr);
+    const bool vertex = instance && IndirectBaseVertex() && parameters.indirect->baseVertexSgpr < 0 && !vertexAttributes && !result.vertexOffsetConflict;
+    BaseInstancePrograms()[codeAddress] = static_cast<std::uint8_t>((instance ? BaseInstanceEligible : 0u) | (vertex ? BaseVertexEligible : 0u));
 }
 
 }
@@ -1202,7 +1214,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 auto& result = results[resultIndex[programIndex]];
                 const auto pushBytes = result.pushConstants.size();
                 decodeVertexInfo(programIndex);
-                if (programIndex == 0 && vertexInfos[0]) vertexInfos[0]->startInstanceSgpr = result.startInstanceSgpr;
+                if (programIndex == 0 && vertexInfos[0]) {
+                    vertexInfos[0]->startInstanceSgpr = result.startInstanceSgpr;
+                    vertexInfos[0]->vertexIndexBase = result.vertexIndexBase;
+                }
                                 result = *materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, programs[programIndex].binary.stage == Stage::TessellationControl || programs[programIndex].binary.stage == Stage::TessellationEvaluation ? direct : drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics);
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 require(result.pushConstants.size() == pushBytes, "patched program changed its push constant layout");

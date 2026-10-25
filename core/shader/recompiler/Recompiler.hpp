@@ -262,6 +262,7 @@ struct ShaderVertexStageInfo {
     std::uint32_t paClVsOutCntl = 0;
     std::uint32_t depthRemapMode = 0;
     std::int32_t startInstanceSgpr = -1;
+    bool vertexIndexBase = false;
     bool pointList = false;
     float pointSize = 1.0f;
     float pointSizeMin = 0.0f;
@@ -755,6 +756,7 @@ struct CompiledShaderArtifact {
     bool vertexOffsetConflict = false;
     bool instanceOffsetConflict = false;
     std::int32_t startInstanceSgpr = -1;
+    bool vertexIndexBase = false;
     std::uint32_t hostSubgroupSize = 0;
     bool fullSubgroups = false;
     bool functionLdsBuffer = false;
