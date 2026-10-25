@@ -303,6 +303,32 @@ std::unordered_map<std::uint64_t, bool>& CpuIndirectPrograms() {
     return HostThreadLocal<std::unordered_map<std::uint64_t, bool>, CpuIndirectProgramsStorage>();
 }
 
+bool IndirectBaseInstance() {
+    static const bool enabled = std::getenv("APS5_INDIRECT_BASE_INSTANCE") != nullptr;
+    return enabled;
+}
+
+struct BaseInstanceProgramsStorage {};
+
+std::unordered_map<std::uint64_t, bool>& BaseInstancePrograms() {
+    return HostThreadLocal<std::unordered_map<std::uint64_t, bool>, BaseInstanceProgramsStorage>();
+}
+
+void RequestBaseInstance(std::uint64_t codeAddress, const Pm4::DrawParameters& parameters, std::optional<ShaderRecompiler::ShaderVertexStageInfo>& info) {
+    if (!info || !parameters.indirect || !IndirectBaseInstance() || parameters.indirect->startInstanceSgpr < 0) return;
+    const auto known = BaseInstancePrograms().find(codeAddress);
+    if (known != BaseInstancePrograms().end() && known->second) info->startInstanceSgpr = parameters.indirect->startInstanceSgpr;
+}
+
+void NoteBaseInstance(std::uint64_t codeAddress, const ShaderRecompiler::RecompileResult& result, const Pm4::DrawParameters& parameters) {
+    if (!parameters.indirect || !IndirectBaseInstance() || result.startInstanceSgpr >= 0) return;
+    const auto sgpr = parameters.indirect->startInstanceSgpr;
+    if (sgpr < 0 || BaseInstancePrograms().contains(codeAddress)) return;
+    const bool instanceAttributes = std::ranges::any_of(result.vertexAttributes, [](const auto& attribute) { return attribute.fetchIndex != 0; });
+    const bool unfolded = result.instanceOffsetSgpr != sgpr || result.instanceOffsetShared;
+    BaseInstancePrograms()[codeAddress] = unfolded && !result.instanceOffsetConflict && (!instanceAttributes || result.instanceOffsetSgpr == sgpr);
+}
+
 }
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected) {
@@ -606,6 +632,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto& program = programs[i];
         if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
         vertexInfos[i] = DecodeOrderedVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, decodeReads[i], 8u - program.firstUserSgpr);
+        if (i == 0) RequestBaseInstance(program.binary.codeAddress, drawParameters, vertexInfos[i]);
         if (vertexInfos[i]) {
             vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, readRegister(queue.context, 0x207), program.tailContinuation.get()) | graphics.layerExports;
             vertexInfos[i]->depthRemapMode = graphics.depthRemap.mode;
@@ -861,6 +888,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
         decodeReads[i].clear();
         vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
+        if (i == 0) RequestBaseInstance(program.binary.codeAddress, drawParameters, vertexInfos[i]);
         if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, tail.reg207, program.tailContinuation.get()) | graphics.layerExports;
     };
     const auto fold = [&](const ShaderRecompiler::RecompileResult& main, Pm4::DrawParameters& parameters) { FoldDrawOffsets(main, programs.front(), parameters); };
@@ -948,6 +976,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
             indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect);
+            NoteBaseInstance(programs.front().binary.codeAddress, result, drawParameters);
             if (EmptyIndirectSkip()) CpuIndirectPrograms()[programs.front().binary.codeAddress] = indirectCpu.has_value();
         } else if (i == 0) {
             fold(result, drawParameters);

@@ -1129,6 +1129,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .instanceOffsetShared = artifact.instanceOffsetShared,
         .vertexOffsetConflict = artifact.vertexOffsetConflict,
         .instanceOffsetConflict = artifact.instanceOffsetConflict,
+        .startInstanceSgpr = request.shader.stage == ShaderStage::Vertex && request.context.vertex.has_value() && !(GcnGuestShaders() && request.context.userDataBaseRegister == 0u) ? request.context.vertex->startInstanceSgpr : -1,
         .hostSubgroupSize = artifact.hostSubgroupSize,
         .fullSubgroups = artifact.fullSubgroups,
         .functionLdsBuffer = artifact.functionLdsBuffer,

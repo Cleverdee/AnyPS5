@@ -474,7 +474,13 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
             for (std::uint32_t reg = 1u; reg <= 3u; reg++) setVector(static_cast<VectorReg>(reg), drawIndex(StageInputKind::InstanceIndex));
         } else {
             setVector(static_cast<VectorReg>(5), drawIndex(StageInputKind::VertexIndex));
-            setVector(static_cast<VectorReg>(8), drawIndex(StageInputKind::InstanceIndex));
+            const auto startInstance = options.inputInfo.vertex->startInstanceSgpr;
+            if (startInstance >= 0) {
+                entryIr.SetScalarReg(static_cast<ScalarReg>(startInstance), builtin(StageInputKind::BaseInstance));
+                setVector(static_cast<VectorReg>(8), entryIr.ISub(builtin(StageInputKind::InstanceIndex), builtin(StageInputKind::BaseInstance)));
+            } else {
+                setVector(static_cast<VectorReg>(8), drawIndex(StageInputKind::InstanceIndex));
+            }
         }
     }
 }

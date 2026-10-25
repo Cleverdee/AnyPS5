@@ -265,6 +265,7 @@ private:
         append(key, value.fetchEmbedded);
         append(key, value.paClVsOutCntl);
         append(key, value.depthRemapMode);
+        if (value.startInstanceSgpr >= 0) append(key, 0x5354415254494e53ull + static_cast<std::uint32_t>(value.startInstanceSgpr));
         append(key, value.pointList);
         append(key, std::bit_cast<std::uint32_t>(value.pointSize));
         append(key, std::bit_cast<std::uint32_t>(value.pointSizeMin));
