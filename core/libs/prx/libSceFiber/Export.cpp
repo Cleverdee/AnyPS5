@@ -106,6 +106,14 @@ static bool TraceFibers() {
     return enabled;
 }
 
+static bool UsesHostStack(std::uint64_t size_context) {
+    static const std::uint64_t limit = [] {
+        const char* value = std::getenv("APS5_FIBER_HOST_STACK_KIB");
+        return value ? std::strtoull(value, nullptr, 0) << 10 : 0;
+    }();
+    return size_context < FIBER_GUEST_STACK_MIN || size_context <= limit;
+}
+
 static void CompletePendingSuspend() {
     auto& thread = ThreadState();
     if (thread.pendingSuspend) {
@@ -439,7 +447,7 @@ static int32_t ValidateContext(const void* addr_context, uint64_t size_context) 
 static void AttachStack(Fiber* fiber, void* addr_context, uint64_t size_context) {
     fiber->context = static_cast<std::uint8_t*>(addr_context);
     fiber->contextSize = size_context;
-    if (size_context < FIBER_GUEST_STACK_MIN) AllocateHostStack(fiber);
+    if (UsesHostStack(size_context)) AllocateHostStack(fiber);
     if (fiber->contextSizeCheck) {
         auto* words = SizedWindow(fiber);
         std::fill(words, words + size_context / sizeof(std::uint64_t), FIBER_CONTEXT_FILL);
