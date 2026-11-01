@@ -220,10 +220,14 @@ void InstallJobIdleSleep() {
         Report("[job-idle] APS5_JOB_IDLE_SLEEP: %d matching job poll call sites, nothing patched\n", matches);
         return;
     }
-    // The thunk must sit within rel32 reach of the call site: take the first free 64 KiB block after the image.
+    // The thunk must sit within rel32 reach of the call site: take the first free 64 KiB block after the image, else before it.
     auto* thunk = static_cast<std::uint8_t*>(nullptr);
     for (auto candidate = (reinterpret_cast<std::uintptr_t>(image) + nt->OptionalHeader.SizeOfImage + 0xffff) & ~std::uintptr_t{0xffff};
          candidate < reinterpret_cast<std::uintptr_t>(site) + 0x40000000ull && thunk == nullptr; candidate += 0x10000) {
+        thunk = static_cast<std::uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    }
+    for (auto candidate = (reinterpret_cast<std::uintptr_t>(image) - 0x10000) & ~std::uintptr_t{0xffff};
+         candidate >= 0x10000 && candidate + 0x40000000ull > reinterpret_cast<std::uintptr_t>(site) && thunk == nullptr; candidate -= 0x10000) {
         thunk = static_cast<std::uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     }
     if (thunk == nullptr) {
