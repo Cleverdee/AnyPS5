@@ -186,11 +186,14 @@ bool MatchesShape(const std::uint8_t* code, const std::int16_t* shape, std::size
 // 8 GB RX 6600 XT with 32 GB of RAM. A variable already set wins; APS5_NO_DS_PRESET=1 turns all of this off.
 // The title comes from app0\sce_sys\param.json, in the working directory or beside the executable.
 bool ParamNamesDemonsSouls(const std::string& path) {
-    std::FILE* file = std::fopen(path.c_str(), "rb");
-    if (file == nullptr) return false;
+    const HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
     std::string text(1u << 20u, '\0');
-    text.resize(std::fread(text.data(), 1, text.size(), file));
-    std::fclose(file);
+    DWORD read = 0;
+    const BOOL ok = ReadFile(file, text.data(), static_cast<DWORD>(text.size()), &read, nullptr);
+    CloseHandle(file);
+    if (!ok) return false;
+    text.resize(read);
     return text.find("\"PPSA01341\"") != std::string::npos || text.find("\"PPSA01342\"") != std::string::npos;
 }
 
