@@ -5,6 +5,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
+#include <atomic>
+#include <cstdlib>
+#include <map>
+#include <tuple>
 #include <array>
 #include <algorithm>
 #include <array>
@@ -123,6 +127,54 @@ bool IsNullTextureResource(std::span<const std::uint32_t> words) {
     const auto base40 = (static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1]) << 32u)) & 0xffffffffffull;
     const auto type = (words[3] >> 28u) & 0xfu;
     return base40 == 0 || type <= 1;
+}
+
+namespace {
+
+// APS5_TEXTURE_REDUCE=1: a sampled 2D block-compressed texture of at least 1024 texels on a side is
+// held without its largest level, as a descriptor from the next level would be (idea and threshold
+// from KytyPS5 KYTY_TEXTURE_REDUCE, GPL-2.0, chenxiao07). Only when the kept levels occupy the same
+// guest bytes with the same layout, which the two surface descriptions below prove.
+bool TextureReduceEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_TEXTURE_REDUCE");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+
+std::optional<GuestTextureResource> ReducedTexture(const GuestTextureResource& full) {
+    if (!TextureReduceEnabled() || full.dimension != TextureDimension::k2D || full.samples != 1u || full.dccAddress != 0u || full.fmaskCmaskAddress != 0u || full.gcnPitch != 0u) return std::nullopt;
+    if (!IsBlockCompressed(full.format) || std::max(full.width, full.height) < 1024u || full.mipCount < 2u || full.lastLevel < 1u || full.baseLevel > full.lastLevel || full.tileMode == TextureTileMode::kLinear) return std::nullopt;
+    auto reduced = full;
+    reduced.width = std::max(full.width >> 1u, 1u);
+    reduced.height = std::max(full.height >> 1u, 1u);
+    reduced.mipCount = full.mipCount - 1u;
+    reduced.baseLevel = full.baseLevel != 0u ? full.baseLevel - 1u : 0u;
+    reduced.lastLevel = full.lastLevel - 1u;
+    reduced.minLod = full.minLod > 256u ? full.minLod - 256u : 0u;
+    using Shape = std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>;
+    thread_local std::map<Shape, bool> proved;
+    const Shape shape{full.format, full.width, full.height, full.mipCount, static_cast<std::uint32_t>(full.tileMode)};
+    auto found = proved.find(shape);
+    if (found == proved.end()) {
+        bool same = false;
+        try {
+            const auto whole = DescribeSurface(full);
+            const auto kept = DescribeSurface(reduced);
+            same = whole.layers == 1u && kept.layers == 1u && !whole.thick && !kept.thick && whole.mips.size() == kept.mips.size() + 1u;
+            for (std::size_t level = 0; same && level < kept.mips.size(); ++level) same = SameLevels(whole.mips[level + 1u], kept.mips[level]);
+        } catch (const std::exception&) {
+            same = false;
+        }
+        static std::atomic<std::uint32_t> reported{0};
+        if (reported.fetch_add(1u, std::memory_order_relaxed) < 32u) std::fprintf(stderr, "[texture-reduce] %ux%u format %u, %u levels, tile %u: %s%c", full.width, full.height, full.format, full.mipCount, static_cast<std::uint32_t>(full.tileMode), same ? "held from level 1" : "levels differ, kept whole", 10);
+        found = proved.emplace(shape, same).first;
+    }
+    if (!found->second) return std::nullopt;
+    return reduced;
+}
+
 }
 
 GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> descriptor) {
@@ -322,6 +374,7 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> descri
         Require(fits, "guest texture descriptor starts past the surface's last mip level at levels that would move the surface's own" + describe());
         result.mipCount = lastLevel + 1u;
     }
+    if (const auto reduced = ReducedTexture(result)) return *reduced;
     return result;
 }
 
