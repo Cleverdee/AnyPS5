@@ -1,5 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include <map>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -58,6 +62,62 @@ BufferPool::~BufferPool() {
     for (auto& [memory, block] : slabBlocks) freeBlock(*block);
 }
 
+namespace {
+
+// APS5_PROFILE_DRAW: live device memory by what asked for it ([vram] line, at most every 10 s),
+// counting what goes through this pool, retained blocks under their first owner's name.
+struct VramLedger {
+    struct Entry {
+        const char* owner;
+        VkDeviceSize bytes;
+        bool deviceLocal;
+    };
+    std::mutex mutex;
+    std::unordered_map<VkDeviceMemory, Entry> entries;
+    std::chrono::steady_clock::time_point lastReport{};
+};
+
+bool VramLedgerEnabled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return enabled;
+}
+
+VramLedger& Ledger() {
+    static auto* ledger = new VramLedger();
+    return *ledger;
+}
+
+void VramNote(VkDeviceMemory memory, const char* owner, VkDeviceSize bytes, bool deviceLocal) {
+    if (!VramLedgerEnabled()) return;
+    auto& ledger = Ledger();
+    std::lock_guard lock(ledger.mutex);
+    ledger.entries[memory] = {owner, bytes, deviceLocal};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - ledger.lastReport < std::chrono::seconds(10)) return;
+    ledger.lastReport = now;
+    std::map<std::string, std::pair<VkDeviceSize, std::uint32_t>> local;
+    VkDeviceSize localTotal = 0, hostTotal = 0;
+    for (const auto& [handle, entry] : ledger.entries) {
+        (entry.deviceLocal ? localTotal : hostTotal) += entry.bytes;
+        if (!entry.deviceLocal) continue;
+        auto& row = local[entry.owner];
+        row.first += entry.bytes;
+        ++row.second;
+    }
+    std::string text;
+    for (const auto& [owner, row] : local) text += " | " + owner + " " + std::to_string(row.first >> 20u) + " MiB x" + std::to_string(row.second);
+    std::fprintf(stderr, "[vram] through the pool: device-local %llu MiB, elsewhere %llu MiB%s%c", static_cast<unsigned long long>(localTotal >> 20u), static_cast<unsigned long long>(hostTotal >> 20u), text.c_str(), 10);
+}
+
+void VramForget(VkDeviceMemory memory) {
+    if (!VramLedgerEnabled()) return;
+    auto& ledger = Ledger();
+    std::lock_guard lock(ledger.mutex);
+    ledger.entries.erase(memory);
+}
+
+}
+
 VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType, std::uint32_t* allocatedType, bool newImage) {
     if (allocatedType != nullptr) *allocatedType = allocation.memoryTypeIndex;
     VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -96,11 +156,13 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
             const auto count = placements.fetch_add(1, std::memory_order_relaxed) + 1;
             const auto total = placedBytes.fetch_add(allocation.allocationSize, std::memory_order_relaxed) + allocation.allocationSize;
             if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[bufferpool] %s: memory type %u is out of device memory for %llu bytes after reclaiming %llu and releasing %llu; placed in host memory type %u until it is released; %llu such allocations, %llu MiB\n", operation, allocation.memoryTypeIndex, static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(reclaimed), static_cast<unsigned long long>(released), *hostType, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u));
+            VramNote(memory, operation, allocation.allocationSize, false);
             return memory;
         }
     }
     if (result == VK_SUCCESS) {
         if (attempts > 1) std::fprintf(stderr, "[bufferpool] %s recovered: allocation=%llu reclaimed=%llu released=%llu initialResult=%d attempts=%u\n", operation, static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(reclaimed), static_cast<unsigned long long>(released), static_cast<int>(initialResult), attempts);
+        VramNote(memory, operation, allocation.allocationSize, (memoryProperties.memoryTypes[allocation.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0);
         return memory;
     }
     char details[1536];
@@ -175,7 +237,7 @@ VkDeviceMemory BufferPool::TakeImageMemory(const VkMemoryAllocateInfo& allocatio
 void BufferPool::PutImageMemory(VkDeviceMemory memory, VkDeviceSize bytes, std::uint32_t memoryType) noexcept {
     if (memory == VK_NULL_HANDLE) return;
     if (!imagePooled(bytes, memoryType)) {
-        freeMemory(device, memory, nullptr);
+        VramForget(memory); freeMemory(device, memory, nullptr);
         return;
     }
     BufferAllocation allocation{VK_NULL_HANDLE, memory, nullptr, 0, bytes, static_cast<std::size_t>(bytes), 0, memoryProperties.memoryTypes[memoryType].propertyFlags};
@@ -290,7 +352,7 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
 
 void BufferPool::freeBlock(SlabBlock& block) noexcept {
     if (block.mapping != nullptr) unmap(device, block.memory);
-    freeMemory(device, block.memory, nullptr);
+    VramForget(block.memory); freeMemory(device, block.memory, nullptr);
 }
 
 VkDeviceSize BufferPool::PutSlot(VkDeviceMemory memory, VkDeviceSize offset) noexcept {
@@ -361,7 +423,7 @@ VkDeviceSize BufferPool::destroy(const BufferAllocation& allocation) noexcept {
     // Device-local allocations (see DeviceBuffer) are never mapped.
     if (allocation.mapping != nullptr) unmap(device, allocation.memory);
     if (allocation.buffer != VK_NULL_HANDLE) destroyBuffer(device, allocation.buffer, nullptr);
-    freeMemory(device, allocation.memory, nullptr);
+    VramForget(allocation.memory); freeMemory(device, allocation.memory, nullptr);
     return allocation.allocationBytes;
 }
 
