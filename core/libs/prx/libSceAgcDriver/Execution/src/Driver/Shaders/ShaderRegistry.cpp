@@ -2434,6 +2434,16 @@ void Driver::RegisterShader(const Shader* shader) {
     }
 
     std::shared_ptr<VulkanDevice> localDevice = device.Load();
+    // Debug aid: APS5_WAIT_WINDOW_DEVICE=<ms> gives AttachWindow that long to make the only device, so
+    // that a profiler attached from the start traces the device that renders.
+    static const auto windowDeviceWaitMs = [] {
+        const char* value = std::getenv("APS5_WAIT_WINDOW_DEVICE");
+        return value != nullptr ? std::strtoll(value, nullptr, 10) : 0ll;
+    }();
+    for (long long waited = 0; localDevice == nullptr && waited < windowDeviceWaitMs; waited += 10) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        localDevice = device.Load();
+    }
     if (localDevice == nullptr) {
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
