@@ -220,15 +220,26 @@ void InstallJobIdleSleep() {
         Report("[job-idle] APS5_JOB_IDLE_SLEEP: %d matching job poll call sites, nothing patched\n", matches);
         return;
     }
-    // The thunk must sit within rel32 reach of the call site: take the first free 64 KiB block after the image, else before it.
+    // The thunk must sit within rel32 reach of the call site: take the first free 64 KiB block after the image.
     auto* thunk = static_cast<std::uint8_t*>(nullptr);
     for (auto candidate = (reinterpret_cast<std::uintptr_t>(image) + nt->OptionalHeader.SizeOfImage + 0xffff) & ~std::uintptr_t{0xffff};
          candidate < reinterpret_cast<std::uintptr_t>(site) + 0x40000000ull && thunk == nullptr; candidate += 0x10000) {
         thunk = static_cast<std::uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     }
-    for (auto candidate = (reinterpret_cast<std::uintptr_t>(image) - 0x10000) & ~std::uintptr_t{0xffff};
-         candidate >= 0x10000 && candidate + 0x40000000ull > reinterpret_cast<std::uintptr_t>(site) && thunk == nullptr; candidate -= 0x10000) {
-        thunk = static_cast<std::uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    // The address space around a low image can be all reserved: use the zero padding after an executable section instead.
+    bool inImagePadding = false;
+    constexpr std::size_t thunkBytes = 320;
+    const auto* lastSection = IMAGE_FIRST_SECTION(nt) + nt->FileHeader.NumberOfSections;
+    for (const auto* candidate = lastSection; thunk == nullptr && candidate != IMAGE_FIRST_SECTION(nt);) {
+        --candidate;
+        if ((candidate->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+        auto* end = image + candidate->VirtualAddress + std::max(candidate->Misc.VirtualSize, candidate->SizeOfRawData);
+        auto* start = reinterpret_cast<std::uint8_t*>((reinterpret_cast<std::uintptr_t>(end) + 15) & ~std::uintptr_t{15});
+        const auto pageEnd = (reinterpret_cast<std::uintptr_t>(end) + 0xfff) & ~std::uintptr_t{0xfff};
+        if (reinterpret_cast<std::uintptr_t>(start) + thunkBytes > pageEnd) continue;
+        if (std::any_of(start, start + thunkBytes, [](std::uint8_t byte) { return byte != 0; })) continue;
+        thunk = start;
+        inImagePadding = true;
     }
     if (thunk == nullptr) {
         Report("[job-idle] APS5_JOB_IDLE_SLEEP: no free page near the image, nothing patched\n");
@@ -268,9 +279,18 @@ void InstallJobIdleSleep() {
     emit({0xc3});                                                     // done: ret
     const auto jump = static_cast<std::int32_t>(ret - (done + 4));
     std::memcpy(code + done, &jump, 4);
-    std::memcpy(thunk, code, n);
     DWORD old = 0;
-    VirtualProtect(thunk, 0x1000, PAGE_EXECUTE_READ, &old);
+    if (inImagePadding && !VirtualProtect(thunk, n, PAGE_EXECUTE_READWRITE, &old)) {
+        Report("[job-idle] APS5_JOB_IDLE_SLEEP: cannot make the section padding writable (%lu), nothing patched\n", GetLastError());
+        return;
+    }
+    std::memcpy(thunk, code, n);
+    if (inImagePadding) {
+        DWORD restoredPadding = 0;
+        VirtualProtect(thunk, n, old, &restoredPadding);
+    } else {
+        VirtualProtect(thunk, 0x1000, PAGE_EXECUTE_READ, &old);
+    }
     FlushInstructionCache(GetCurrentProcess(), thunk, n);
     // Rewrite the call's rel32 with one aligned 8-byte store (no guest thread runs yet, but stay atomic).
     auto* word = reinterpret_cast<std::uint8_t*>(reinterpret_cast<std::uintptr_t>(site + 1) & ~std::uintptr_t{7});
