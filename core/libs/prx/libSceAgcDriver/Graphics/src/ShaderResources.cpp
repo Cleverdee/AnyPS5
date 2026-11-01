@@ -3557,6 +3557,19 @@ bool ShaderResources::EpochProofs() {
 }
 
 namespace {
+void noteProofGate(bool first, bool epoch, bool proof, bool pending) {
+    static const bool report = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!report) return;
+    static std::atomic<std::uint64_t> total{0}, firsts{0}, epochs{0}, proofs{0}, pendings{0};
+    if (first) firsts.fetch_add(1, std::memory_order_relaxed);
+    else {
+        if (epoch) epochs.fetch_add(1, std::memory_order_relaxed);
+        if (proof) proofs.fetch_add(1, std::memory_order_relaxed);
+        if (pending) pendings.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (const auto count = total.fetch_add(1, std::memory_order_relaxed) + 1u; count % 262144u == 0u) std::fprintf(stderr, "[proof-gates] %llu re-proved: no earlier proof %llu; moved past it: epoch %llu, proof serial %llu, pending serial %llu%c", static_cast<unsigned long long>(count), static_cast<unsigned long long>(firsts.load()), static_cast<unsigned long long>(epochs.load()), static_cast<unsigned long long>(proofs.load()), static_cast<unsigned long long>(pendings.load()), 10);
+}
+
 void noteEpochProof(bool reused, bool verified, bool failed) {
     static std::atomic<std::uint64_t> reuses{0}, proofs{0}, checks{0}, failures{0};
     if (verified) checks.fetch_add(1, std::memory_order_relaxed);
@@ -3585,6 +3598,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             noteEpochProof(true, false, false);
             return true;
         }
+        noteProofGate(provedEpoch == 0, epoch != provedEpoch, proof != provedProof, pending != provedPending);
         const bool ok = revalidateFull(shaders, report);
         noteEpochProof(false, false, false);
         if (ok) {
@@ -5851,6 +5865,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         keep({begin, std::move(buffer), offset, bytes});
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
+    }
+    static const bool bindingStats = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (bindingStats) {
+        static std::atomic<std::uint64_t> calls{0}, none{0}, withMoved{0}, snapshotsMade{0};
+        if (selected.empty()) none.fetch_add(1, std::memory_order_relaxed);
+        if (!moved.empty()) withMoved.fetch_add(1, std::memory_order_relaxed);
+        snapshotsMade.fetch_add(selected.size(), std::memory_order_relaxed);
+        if (const auto count = calls.fetch_add(1, std::memory_order_relaxed) + 1u; count % 262144u == 0u) std::fprintf(stderr, "[draw-bindings] %llu calls: %llu with nothing to rewrite, %llu with moved buffers, %llu snapshots bound%c", static_cast<unsigned long long>(count), static_cast<unsigned long long>(none.load()), static_cast<unsigned long long>(withMoved.load()), static_cast<unsigned long long>(snapshotsMade.load()), 10);
     }
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
