@@ -19,6 +19,7 @@
 #include <iterator>
 #include <utility>
 #include <mutex>
+#include <string>
 #include "Sse4aEmulation.hpp"
 
 namespace {
@@ -179,6 +180,56 @@ bool MatchesShape(const std::uint8_t* code, const std::int16_t* shape, std::size
         if (shape[i] >= 0 && code[i] != static_cast<std::uint8_t>(shape[i])) return false;
     }
     return true;
+}
+
+// Demon's Souls (PPSA01341, PPSA01342): the switches of test/ds-main7 turn on by themselves, tuned on an
+// 8 GB RX 6600 XT with 32 GB of RAM. A variable already set wins; APS5_NO_DS_PRESET=1 turns all of this off.
+// The title comes from app0\sce_sys\param.json, in the working directory or beside the executable.
+bool ParamNamesDemonsSouls(const std::string& path) {
+    std::FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) return false;
+    std::string text(1u << 20u, '\0');
+    text.resize(std::fread(text.data(), 1, text.size(), file));
+    std::fclose(file);
+    return text.find("\"PPSA01341\"") != std::string::npos || text.find("\"PPSA01342\"") != std::string::npos;
+}
+
+void ApplyDemonsSoulsPreset() {
+    if (std::getenv("APS5_NO_DS_PRESET") != nullptr) return;
+    char module[MAX_PATH]{};
+    std::string beside;
+    if (const auto length = GetModuleFileNameA(nullptr, module, MAX_PATH); length != 0 && length < MAX_PATH) {
+        beside = module;
+        beside.resize(beside.find_last_of("\/") + 1u);
+    }
+    if (!ParamNamesDemonsSouls("app0\sce_sys\param.json") && !ParamNamesDemonsSouls(beside + "app0\sce_sys\param.json")) return;
+    static constexpr std::pair<const char*, const char*> preset[] = {
+        {"APS5_UNKEYED_TABLE_KEYS", "256"},
+        {"APS5_THREAD_PRIORITY", "high"},
+        {"APS5_JOB_IDLE_SLEEP", "1"},
+        {"APS5_FIBER_HOST_STACK_KIB", "64"},
+        {"APS5_INDIRECT_BASE_INSTANCE", "1"},
+        {"APS5_INDIRECT_BASE_VERTEX", "1"},
+        {"APS5_INDIRECT_PASS_CONTINUE", "1"},
+        {"APS5_INDIRECT_NO_INDEX_CLAMP", "1"},
+        {"APS5_TEXTURE_CACHE_MIB", "3072"},
+        {"APS5_DEPTH_PLANE_COPY_MIB", "1024"},
+        {"APS5_NO_BDA_STAGING", "1"},
+        {"APS5_HOST_IMPORT_MIB", "10240"},
+        {"APS5_PIPELINE_GPU_INDIRECT", "1"},
+        {"APS5_DRAW_PIPELINE", "1"},
+        {"APS5_PIPELINE_DISPATCH", "1"},
+        {"APS5_TEXTURE_REDUCE", "1"},
+        {"APS5_RESOURCE_CACHE_ENTRIES", "8192"},
+        {"APS5_TARGET_MEMO", "1"},
+    };
+    int applied = 0;
+    for (const auto& [name, value] : preset) {
+        if (std::getenv(name) != nullptr) continue;
+        _putenv_s(name, value);
+        ++applied;
+    }
+    Report("[ds-preset] Demon's Souls: %d switches turned on (APS5_NO_DS_PRESET=1 turns this off)\n", applied);
 }
 
 void InstallJobIdleSleep() {
@@ -839,6 +890,7 @@ struct ExitReporter {
 } g_exitReporter;
 
 const bool g_crashReportInstalled = [] {
+    ApplyDemonsSoulsPreset();
     g_sse4aEmulation = !IsEnvironmentSet("APS5_NO_SSE4A_EMULATION");
     g_sse4aTrace = IsEnvironmentSet("APS5_TRACE_SSE4A");
     AddVectoredExceptionHandler(1, ReportCrash);
