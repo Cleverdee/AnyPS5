@@ -3226,12 +3226,11 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
         surface.collected = GuestMemory::CollectWrites(address, bytes);
-        if (surface.collected == 0) {
+        if (surface.collected == 0 && !surface.committed.has_value()) {
             countCollectRefusal(false, address, bytes);
             return fail(FastFail::Collect);
         }
         const auto* source = surface.source;
-        surface.collected = GuestMemory::CollectWrites(address, bytes);
         if (surface.committed.has_value()) {
             // Partially resident snapshot: cachedTexture's unchanged rule over the committed pages
             // (the same ranges still committed, none written since, no recorded write pending).
