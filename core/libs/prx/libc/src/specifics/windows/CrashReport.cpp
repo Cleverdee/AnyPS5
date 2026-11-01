@@ -203,9 +203,9 @@ void ApplyDemonsSoulsPreset() {
     std::string beside;
     if (const auto length = GetModuleFileNameA(nullptr, module, MAX_PATH); length != 0 && length < MAX_PATH) {
         beside = module;
-        beside.resize(beside.find_last_of("\/") + 1u);
+        beside.resize(beside.find_last_of("/\\") + 1u);
     }
-    if (!ParamNamesDemonsSouls("app0\sce_sys\param.json") && !ParamNamesDemonsSouls(beside + "app0\sce_sys\param.json")) return;
+    if (!ParamNamesDemonsSouls("app0/sce_sys/param.json") && !ParamNamesDemonsSouls(beside + "app0/sce_sys/param.json")) return;
     static constexpr std::pair<const char*, const char*> preset[] = {
         {"APS5_UNKEYED_TABLE_KEYS", "256"},
         {"APS5_THREAD_PRIORITY", "high"},
