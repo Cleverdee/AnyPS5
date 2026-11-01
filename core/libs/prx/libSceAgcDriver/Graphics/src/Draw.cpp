@@ -2892,6 +2892,79 @@ void rememberShape(const Context& context, std::uint64_t shape, std::span<const 
     choices.insert(choices.begin(), std::move(choice));
 }
 
+// APS5_TARGET_MEMO=1: a draw whose color target equals the previous draw's in that slot, with no collect
+// epoch, proof serial or pending serial move since its lookup, reuses that resident image (the idea of
+// KytyPS5's ImagesEpoch, chenxiao07, GPL-2.0). APS5_VERIFY_TARGET_MEMO=1 does every lookup and compares.
+bool TargetMemoEnabled() {
+    static const bool enabled = std::getenv("APS5_TARGET_MEMO") != nullptr && ShaderResources::EpochProofs();
+    return enabled;
+}
+
+bool VerifyTargetMemo() {
+    static const bool verify = std::getenv("APS5_VERIFY_TARGET_MEMO") != nullptr;
+    return verify;
+}
+
+struct TargetMemoEntry {
+    ColorTarget color{};
+    std::shared_ptr<StorageTexture> resident;
+    std::uint64_t epoch = 0;
+    std::uint64_t proof = 0;
+    std::uint64_t pending = 0;
+};
+
+std::array<TargetMemoEntry, 8>& TargetMemo() {
+    thread_local std::array<TargetMemoEntry, 8>* memo = nullptr;
+    return ShaderRecompiler::ThreadOwned(memo);
+}
+
+bool SameMemoTarget(const ColorTarget& a, const ColorTarget& b) {
+    return a.address == b.address && a.extent.width == b.extent.width && a.extent.height == b.extent.height && a.format == b.format && a.bytes == b.bytes && a.tileMode == b.tileMode && a.dccAddress == b.dccAddress && a.chainDccAddress == b.chainDccAddress && a.cmaskAddress == b.cmaskAddress && a.cmaskFastClear == b.cmaskFastClear && a.surfaceAddress == b.surfaceAddress && a.mipCount == b.mipCount && a.mip == b.mip && a.mipTail == b.mipTail && a.clearWords == b.clearWords && a.depth == b.depth && a.depthSlice == b.depthSlice && a.arrayAddress == b.arrayAddress && a.arrayLastSlice == b.arrayLastSlice && a.arraySlice == b.arraySlice && a.layers == b.layers && a.pipeBankXor == b.pipeBankXor && a.samples == b.samples && a.fmaskAddress == b.fmaskAddress;
+}
+
+void countTargetMemo(bool hit, bool checked, bool failed) {
+    static std::atomic<std::uint64_t> hits{0}, misses{0}, checks{0}, failures{0};
+    if (checked) checks.fetch_add(1, std::memory_order_relaxed);
+    if (failed) failures.fetch_add(1, std::memory_order_relaxed);
+    const auto count = (hit ? hits : misses).fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (hit && count % 200000u == 0u) std::fprintf(stderr, "[target-memo] %llu hits, %llu misses; verify: %llu checked, %llu failed%c", static_cast<unsigned long long>(hits.load()), static_cast<unsigned long long>(misses.load()), static_cast<unsigned long long>(checks.load()), static_cast<unsigned long long>(failures.load()), 10);
+}
+
+bool targetMemoHolds(const TargetMemoEntry& entry, const ColorTarget& color) {
+    const auto epoch = GuestMemory::CollectEpoch();
+    return entry.resident != nullptr && epoch != 0 && entry.epoch == epoch && entry.proof == GuestMemory::ProofSerial() && entry.pending == StorageTexture::PendingSerial() && entry.resident->Cached() && !color.cmaskFastClear && SameMemoTarget(entry.color, color);
+}
+
+std::shared_ptr<StorageTexture> repeatedTarget(std::size_t slot, const ColorTarget& color) {
+    if (slot >= TargetMemo().size()) return nullptr;
+    const auto& entry = TargetMemo()[slot];
+    if (!targetMemoHolds(entry, color)) {
+        countTargetMemo(false, false, false);
+        return nullptr;
+    }
+    countTargetMemo(true, false, false);
+    return entry.resident;
+}
+
+void noteTarget(std::size_t slot, const ColorTarget& color, const std::shared_ptr<StorageTexture>& resident) {
+    if (slot >= TargetMemo().size()) return;
+    auto& entry = TargetMemo()[slot];
+    if (VerifyTargetMemo()) {
+        if (targetMemoHolds(entry, color)) {
+            const bool same = entry.resident == resident;
+            countTargetMemo(true, true, !same);
+            if (!same) std::fprintf(stderr, "[target-memo] verify: target 0x%llx would have used a stale image%c", static_cast<unsigned long long>(color.address), 10);
+        } else {
+            countTargetMemo(false, false, false);
+        }
+    }
+    entry.color = color;
+    entry.resident = resident;
+    entry.epoch = GuestMemory::CollectEpoch();
+    entry.proof = GuestMemory::ProofSerial();
+    entry.pending = StorageTexture::PendingSerial();
+}
+
 // APS5_PROFILE_DRAW: how many draws repeat the previous draw's targets, and of those how many see no
 // epoch, proof or pending serial move: what skipping per-draw target checks could reach ([draw-repeat]).
 void noteDrawRepeat(const State& state) {
@@ -3017,7 +3090,8 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             // (GuestMemory::BumpCollectEpoch: ordering points of the queue, or every packet under
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
-            binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
+            binding.resident = TargetMemoEnabled() && !VerifyTargetMemo() ? repeatedTarget(index, color) : nullptr;
+            if (binding.resident == nullptr) binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
                     const auto array = ArraySurfaceForTarget(color);
@@ -3041,6 +3115,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
                 Require(color.mipCount > 1 || color.depth > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
                 return resident;
             });
+            if (TargetMemoEnabled()) noteTarget(index, color, binding.resident);
         }
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
