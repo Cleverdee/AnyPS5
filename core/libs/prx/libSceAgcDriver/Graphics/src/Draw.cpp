@@ -2892,6 +2892,39 @@ void rememberShape(const Context& context, std::uint64_t shape, std::span<const 
     choices.insert(choices.begin(), std::move(choice));
 }
 
+// APS5_PROFILE_DRAW: how many draws repeat the previous draw's targets, and of those how many see no
+// epoch, proof or pending serial move: what skipping per-draw target checks could reach ([draw-repeat]).
+void noteDrawRepeat(const State& state) {
+    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!enabled) return;
+    thread_local std::vector<std::uint64_t> lastTargets;
+    thread_local std::vector<std::uint64_t> targets;
+    thread_local std::uint64_t lastEpoch = 0, lastProof = 0, lastPending = 0;
+    thread_local std::uint64_t draws = 0, sameTargets = 0, sameEpoch = 0, sameProof = 0, samePending = 0, all = 0;
+    targets.clear();
+    for (const auto& color : state.colors) targets.push_back(color.address);
+    targets.push_back(state.depth ? state.depth->address : 0u);
+    const auto epoch = GuestMemory::CollectEpoch();
+    const auto proof = GuestMemory::ProofSerial();
+    const auto pending = StorageTexture::PendingSerial();
+    ++draws;
+    if (targets == lastTargets) {
+        ++sameTargets;
+        if (epoch == lastEpoch) ++sameEpoch;
+        if (proof == lastProof) ++sameProof;
+        if (pending == lastPending) ++samePending;
+        if (epoch == lastEpoch && proof == lastProof && pending == lastPending) ++all;
+    }
+    lastTargets = targets;
+    lastEpoch = epoch;
+    lastProof = proof;
+    lastPending = pending;
+    if (draws == 200000u) {
+        std::fprintf(stderr, "[draw-repeat] of %llu draws: same targets as the last %llu; of those same epoch %llu, proof serial %llu, pending serial %llu, all three %llu%c", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(sameTargets), static_cast<unsigned long long>(sameEpoch), static_cast<unsigned long long>(sameProof), static_cast<unsigned long long>(samePending), static_cast<unsigned long long>(all), 10);
+        draws = sameTargets = sameEpoch = sameProof = samePending = all = 0;
+    }
+}
+
 bool prepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, PreparedDraw& prepared) {
     auto*& recipeOut = prepared.recipeOut;
     auto& stencilReferences = prepared.stencilReferences;
@@ -2919,6 +2952,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     }
     if (state.quadList || StripPatches(state, shaders)) recipeOut = nullptr;
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
+    noteDrawRepeat(state);
     auto& timing = prepared.timing.emplace("Graphics.Draw");
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
